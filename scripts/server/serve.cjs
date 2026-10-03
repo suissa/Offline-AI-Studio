@@ -200,6 +200,14 @@ const TTS_MODEL_CATALOG = [
     recommended: false,
   },
 ];
+const PIPER_TTS_CATALOG = {
+  id: "piper-tts",
+  name: "Piper TTS (local .onnx model)",
+  filename: "piper-tts.json",
+  format: "Piper ONNX",
+  size: "Local model file",
+  recommended: false,
+};
 const TTS_VOICES = [
   { id: "af_heart", name: "Heart", language: "en-us", gender: "Female", recommended: true },
   { id: "af_bella", name: "Bella", language: "en-us", gender: "Female", recommended: false },
@@ -275,6 +283,8 @@ let ttsSettings = {
   speed: 1,
   dtype: "q8",
   backendMode: "Kokoro ONNX",
+  piperModelPath: "",
+  piperBinaryPath: "",
 };
 let ttsGenerationState = {
   active: false,
@@ -2208,7 +2218,25 @@ function getTtsModels() {
     };
   });
 
-  const known = new Set(catalog.map((model) => model.filename.toLowerCase()));
+  const piperManifest = readTtsManifest(PIPER_TTS_CATALOG.filename);
+  const piperModel = {
+    ...PIPER_TTS_CATALOG,
+    ...(piperManifest || {}),
+    installed: Boolean(piperManifest),
+    engine: "Piper TTS",
+    sizeBytes: piperManifest && piperManifest.modelPath && fs.existsSync(piperManifest.modelPath)
+      ? getPathSize(piperManifest.modelPath)
+      : 0,
+    url: `piper://install/${PIPER_TTS_CATALOG.id}`,
+  };
+  piperModel.localSize = piperModel.sizeBytes ? formatBytes(piperModel.sizeBytes) : "";
+  if (piperManifest && piperManifest.modelPath && fs.existsSync(piperManifest.modelPath)) {
+    try {
+      piperModel.size = formatBytes(piperManifest.sizeBytes || piperModel.sizeBytes);
+    } catch (_) {}
+  }
+
+  const known = new Set([...catalog, piperModel].map((model) => model.filename.toLowerCase()));
   let custom = [];
   try {
     custom = fs.readdirSync(TTS_MODELS)
@@ -2232,19 +2260,201 @@ function getTtsModels() {
         };
       });
   } catch (_) {}
-  return [...catalog, ...custom];
+  return [...catalog, piperModel, ...custom];
 }
 
 function resolveTtsModel(value) {
   const raw = String(value || "").trim();
   const model = getTtsModels().find((item) => item.id === raw || item.filename === raw) ||
     getTtsModels().find((item) => item.installed);
-  if (!model) throw new Error("Download or import a Kokoro TTS model from Model Manager first.");
+  if (!model) throw new Error("Download or import a TTS model (Kokoro or Piper) from Model Manager first.");
+  if (model.id === PIPER_TTS_CATALOG.id) {
+    const manifest = readTtsManifest(PIPER_TTS_CATALOG.filename);
+    if (!manifest) throw new Error("Piper TTS model is not configured. Add MODEL_PATH and PIPER_BINARY_PATH in Model Manager first.");
+    return { ...model, path: getTtsManifestPath(PIPER_TTS_CATALOG.filename), engine: "Piper TTS" };
+  }
   const manifestPath = getTtsManifestPath(model.filename);
   if (!manifestPath || !fs.existsSync(manifestPath)) {
     throw new Error(`TTS model is not installed: ${model.filename}`);
   }
   return { ...model, path: manifestPath };
+}
+
+// ── Piper TTS support ─────────────────────────────────────────────────────────
+function getPiperModelDir() {
+  try {
+    const raw = String(ttsSettings.piperModelPath || "").trim();
+    if (raw) {
+      const resolved = path.resolve(raw);
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) return resolved;
+    }
+  } catch (_) {}
+  return TTS_MODELS;
+}
+
+function piperWavDateStamp(date = new Date()) {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${date.getFullYear()}-${months[date.getMonth()]}-${String(date.getDate()).padStart(2, "0")}.wav`;
+}
+
+function resolvePiperPaths(settings = {}) {
+  const modelRaw = String(settings.modelPath ?? ttsSettings.piperModelPath ?? "").trim();
+  const binaryRaw = String(settings.binaryPath ?? ttsSettings.piperBinaryPath ?? "").trim();
+  if (!modelRaw) throw new Error("Piper model path is not configured. Add it in Model Manager -> TTS Model Library (MODEL_PATH).");
+  if (!binaryRaw) throw new Error("Piper binary path is not configured. Add it in Model Manager -> TTS Model Library (PIPER_BINARY_PATH).");
+  const modelPath = path.resolve(modelRaw);
+  if (!fs.existsSync(modelPath)) {
+    throw new Error(`Piper model file not found: ${modelPath}`);
+  }
+  const binaryIsCommand = !binaryRaw.includes("/") && !binaryRaw.includes("\\");
+  const binaryPath = binaryIsCommand ? binaryRaw : path.resolve(binaryRaw);
+  if (!binaryIsCommand && !fs.existsSync(binaryPath)) {
+    throw new Error(`Piper binary not found: ${binaryPath}`);
+  }
+  return { modelPath, binaryPath, binaryIsCommand };
+}
+
+function installPiperTtsModel(modelPath, binaryPath) {
+  const cleanModel = String(modelPath || "").trim();
+  const cleanBinary = String(binaryPath || "").trim();
+  if (!cleanModel) throw new Error("MODEL_PATH is required.");
+  if (!cleanBinary) throw new Error("PIPER_BINARY_PATH is required.");
+  const resolvedModel = path.resolve(cleanModel);
+  if (!fs.existsSync(resolvedModel)) {
+    throw new Error(`Piper model file not found: ${resolvedModel}`);
+  }
+  const manifestPath = getTtsManifestPath(PIPER_TTS_CATALOG.filename);
+  if (!manifestPath) throw new Error("Could not write the Piper TTS manifest.");
+  const manifest = {
+    ...PIPER_TTS_CATALOG,
+    installed: true,
+    createdAt: new Date().toISOString(),
+    modelPath: resolvedModel,
+    binaryPath: cleanBinary,
+    notes: "Piper TTS model. Audio is generated with the external piper binary and saved next to MODEL_PATH.",
+  };
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  return manifest;
+}
+
+function synthesizePiperTts(text, options = {}) {
+  return new Promise((resolve, reject) => {
+    const cleanedText = String(text || "").trim();
+    if (!cleanedText) {
+      reject(new Error("Enter text to synthesize."));
+      return;
+    }
+    let piper;
+    try {
+      piper = resolvePiperPaths(options);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    // OUTPUT_FILE uses the current date (YYYY-MMM-DD.wav) and is saved in the MODEL_PATH folder.
+    const outputFileName = piperWavDateStamp();
+    let outputPath = path.join(path.dirname(piper.modelPath), outputFileName);
+    if (!pathInside(outputPath, path.dirname(piper.modelPath))) {
+      outputPath = path.join(getPiperModelDir(), outputFileName);
+    }
+
+    ttsGenerationState = {
+      active: true,
+      phase: "Generating speech with Piper...",
+      progress: -1,
+      model: PIPER_TTS_CATALOG.filename,
+      voice: String(options.voice || ttsSettings.voice || ""),
+      output: "",
+    };
+
+    const startedAt = Date.now();
+    // echo "${TEXT}" | piper --model "$MODEL" --output_file "${OUTPUT_FILE}"
+    const proc = spawn(piper.binaryPath, ["--model", piper.modelPath, "--output_file", outputPath], {
+      cwd: ROOT,
+      stdio: "pipe",
+      windowsHide: true,
+      shell: piper.binaryIsCommand,
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (data) => { stdout += data.toString(); });
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+      process.stderr.write("  [piper] " + data.toString());
+    });
+    proc.on("error", (err) => {
+      ttsGenerationState = { active: false, phase: "Failed", progress: 0, model: PIPER_TTS_CATALOG.filename, voice: ttsSettings.voice, output: "" };
+      reject(err);
+    });
+    proc.on("exit", (code) => {
+      ttsGenerationState = { active: false, phase: code === 0 ? "Complete" : "Failed", progress: code === 0 ? 100 : 0, model: PIPER_TTS_CATALOG.filename, voice: String(options.voice || ttsSettings.voice || ""), output: "" };
+      if (code !== 0) {
+        const message = (stderr || stdout || `Piper TTS exited with code ${code}`).trim().slice(-1400);
+        ttsError = message;
+        reject(new Error(message));
+        return;
+      }
+      try {
+        if (!fs.existsSync(outputPath)) {
+          throw new Error("Piper TTS did not produce a WAV file.");
+        }
+        ensureBrowserCompatibleTtsWav(outputPath);
+        const stat = fs.statSync(outputPath);
+        const createdAt = new Date().toISOString();
+        const stamp = createdAt.replace(/[:.]/g, "-");
+        const jsonFilename = `tts-${stamp}-${safeOutputName(path.basename(outputPath))}.json`;
+        let savedToHistory = false;
+        try {
+          fs.writeFileSync(path.join(TTS_OUTPUTS, jsonFilename), JSON.stringify({
+            text: cleanedText,
+            model: PIPER_TTS_CATALOG.filename,
+            modelName: PIPER_TTS_CATALOG.name,
+            voice: String(options.voice || ttsSettings.voice || "piper"),
+            speed: Number(options.speed) || ttsSettings.speed || 1,
+            durationMs: Date.now() - startedAt,
+            sampleRate: 22050,
+            createdAt,
+            audioFile: path.basename(outputPath),
+            audioPath: outputPath,
+            engine: "Piper TTS",
+            modelPath: piper.modelPath,
+            binaryPath: piper.binaryPath,
+            metadata: jsonFilename,
+            displayName: `Piper - ${cleanedText.slice(0, 40)}`,
+          }, null, 2), "utf8");
+          savedToHistory = true;
+        } catch (_) {}
+        const metadata = {
+          text: cleanedText,
+          model: PIPER_TTS_CATALOG.filename,
+          modelName: PIPER_TTS_CATALOG.name,
+          voice: String(options.voice || ttsSettings.voice || "piper"),
+          voiceName: String(options.voice || ttsSettings.voice || "Piper"),
+          speed: Number(options.speed) || ttsSettings.speed || 1,
+          durationMs: Date.now() - startedAt,
+          sampleRate: 22050,
+          createdAt,
+          audioFile: path.basename(outputPath),
+          audioPath: outputPath,
+          engine: "Piper TTS",
+          modelPath: piper.modelPath,
+          binaryPath: piper.binaryPath,
+          sizeBytes: stat.size,
+          size: formatBytes(stat.size),
+          modifiedAt: stat.mtime.toISOString(),
+          displayName: `Piper - ${cleanedText.slice(0, 40)}`,
+          filename: savedToHistory ? jsonFilename : "",
+          url: `/tts-model-file/${encodeURIComponent(path.basename(outputPath))}`,
+        };
+        ttsError = null;
+        resolve(metadata);
+      } catch (err) {
+        ttsError = err.message || String(err);
+        reject(err);
+      }
+    });
+    proc.stdin.end(cleanedText);
+  });
 }
 
 function getTtsRuntimeStatus() {
@@ -2266,11 +2476,33 @@ function runExclusiveTtsOperation(operation) {
 }
 
 async function startTts(settings = {}) {
+  const requestedModel = settings.model || ttsSettings.model;
+  const model = resolveTtsModel(requestedModel);
+  if (model.engine === "Piper TTS" || model.id === PIPER_TTS_CATALOG.id) {
+    // Piper does not need the kokoro-js runtime, but it needs MODEL_PATH and PIPER_BINARY_PATH.
+    const piper = resolvePiperPaths({
+      modelPath: settings.modelPath ?? model.modelPath ?? settings.piperModelPath ?? ttsSettings.piperModelPath,
+      binaryPath: settings.binaryPath ?? model.binaryPath ?? settings.piperBinaryPath ?? ttsSettings.piperBinaryPath,
+    });
+    PORT_TTS = PREFERRED_TTS_PORT;
+    ttsError = null;
+    ttsReady = true;
+    ttsSettings = {
+      ...ttsSettings,
+      model: model.filename,
+      voice: settings.voice || ttsSettings.voice || "af_heart",
+      speed: Math.max(0.5, Math.min(2, Number(settings.speed) || ttsSettings.speed || 1)),
+      dtype: ttsSettings.dtype,
+      backendMode: "Piper TTS",
+      piperModelPath: piper.modelPath,
+      piperBinaryPath: piper.binaryPath,
+    };
+    return;
+  }
   const runtime = getTtsRuntimeStatus();
   if (!runtime.installed) {
     throw new Error("Kokoro TTS runtime is not installed. Run scripts/setup/setup-tts for this platform.");
   }
-  const model = resolveTtsModel(settings.model || ttsSettings.model);
   PORT_TTS = PREFERRED_TTS_PORT;
   ttsError = null;
   ttsReady = true;
@@ -2405,6 +2637,7 @@ function listTtsOutputs() {
               ensureBrowserCompatibleTtsWav(audioPath);
             }
           }
+          const piperAudioAvailable = Boolean(metadata.audioPath && fs.existsSync(metadata.audioPath));
           return {
             ...metadata,
             filename: file,
@@ -2413,7 +2646,9 @@ function listTtsOutputs() {
             size: formatBytes(stat.size),
             modifiedAt: stat.mtime.toISOString(),
             createdAt: metadata.createdAt || stat.mtime.toISOString(),
-            url: metadata.audioFile ? `/tts-outputs/${encodeURIComponent(metadata.audioFile)}` : "",
+            url: metadata.engine === "Piper TTS"
+              ? (piperAudioAvailable ? `/tts-model-file/${encodeURIComponent(path.basename(String(metadata.audioPath)))}` : "")
+              : (metadata.audioFile ? `/tts-outputs/${encodeURIComponent(metadata.audioFile)}` : ""),
           };
         } catch (_) {
           return null;
@@ -2427,6 +2662,11 @@ function listTtsOutputs() {
 }
 
 function synthesizeTts(text, options = {}) {
+  const activeModelName = String(options.model || ttsSettings.model || "");
+  if (activeModelName === PIPER_TTS_CATALOG.filename || activeModelName === PIPER_TTS_CATALOG.id ||
+    ttsSettings.backendMode === "Piper TTS") {
+    return synthesizePiperTts(text, options);
+  }
   return new Promise((resolve, reject) => {
     const cleanedText = String(text || "").trim();
     if (!cleanedText) {
@@ -6288,8 +6528,24 @@ const server = http.createServer(async (req, res) => {
     const body = await readJsonBody(req, res);
     if (!body) return;
     try {
+      const raw = String(body.modelId || body.model_id || body.model || body.filename || "").trim();
+      if (raw === PIPER_TTS_CATALOG.id || raw === PIPER_TTS_CATALOG.filename || raw.startsWith("piper://")) {
+        const model = installPiperTtsModel(body.modelPath || body.MODEL_PATH, body.binaryPath || body.PIPER_BINARY_PATH);
+        return json(res, 200, { ok: true, message: "Piper TTS model configured", filename: model.filename, model });
+      }
       const model = installTtsCatalogModel(body.modelId || body.model_id || body.model || body.filename);
       return json(res, 200, { ok: true, message: "TTS model manifest installed", filename: model.filename, model });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: err.message || String(err) });
+    }
+  }
+
+  if (req.url === "/api/tts/piper-config" && req.method === "POST") {
+    const body = await readJsonBody(req, res);
+    if (!body) return;
+    try {
+      const model = installPiperTtsModel(body.modelPath || body.MODEL_PATH, body.binaryPath || body.PIPER_BINARY_PATH);
+      return json(res, 200, { ok: true, message: "Piper TTS paths saved", filename: model.filename, model });
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message || String(err) });
     }
@@ -7131,7 +7387,84 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     return;
   }
 
-  // POST /api/save-output
+  // GET /tts-model-file/<basename> - serves Piper TTS WAV outputs saved next to MODEL_PATH.
+  if (req.url.startsWith("/tts-model-file/") && req.method === "GET") {
+    const filename = path.basename(decodeURIComponent(req.url.replace(/^\/tts-model-file\//, "").split("?")[0] || ""));
+    let filePath = "";
+    try {
+      const manifest = readTtsManifest(PIPER_TTS_CATALOG.filename);
+      const historyMatch = listTtsOutputs().find((item) =>
+        item.engine === "Piper TTS" && item.audioFile === filename && item.audioPath && fs.existsSync(item.audioPath));
+      const candidates = [];
+      if (historyMatch) candidates.push(historyMatch.audioPath);
+      if (manifest && manifest.modelPath) candidates.push(path.join(path.dirname(manifest.modelPath), filename));
+      candidates.push(path.join(getPiperModelDir(), filename));
+      for (const candidate of candidates) {
+        if (candidate && fs.existsSync(candidate) && path.extname(candidate).toLowerCase() === ".wav") {
+          filePath = candidate;
+          break;
+        }
+      }
+    } catch (_) {}
+    if (!filename || !filePath) {
+      return json(res, 404, { ok: false, error: "Piper TTS output not found" });
+    }
+    ensureBrowserCompatibleTtsWav(filePath);
+    const stat = fs.statSync(filePath);
+    const contentType = MIME[path.extname(filePath).toLowerCase()] || "application/octet-stream";
+    const range = req.headers.range;
+
+    if (range) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (!match) {
+        res.writeHead(416, {
+          "Content-Range": `bytes */${stat.size}`,
+          "Accept-Ranges": "bytes",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end();
+        return;
+      }
+
+      let start = match[1] ? Number(match[1]) : 0;
+      let end = match[2] ? Number(match[2]) : stat.size - 1;
+      if (!match[1] && match[2]) {
+        const suffixLength = Math.min(Number(match[2]) || 0, stat.size);
+        start = stat.size - suffixLength;
+        end = stat.size - 1;
+      }
+
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end >= stat.size || start > end) {
+        res.writeHead(416, {
+          "Content-Range": `bytes */${stat.size}`,
+          "Accept-Ranges": "bytes",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end();
+        return;
+      }
+
+      res.writeHead(206, {
+        "Content-Type": contentType,
+        "Content-Length": end - start + 1,
+        "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+        "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*",
+      });
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+      return;
+    }
+
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Content-Length": stat.size,
+      "Accept-Ranges": "bytes",
+      "Access-Control-Allow-Origin": "*",
+    });
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
+
   if (req.url === "/api/save-output" && req.method === "POST") {
     try {
       const body = await readJsonBody(req, res);
