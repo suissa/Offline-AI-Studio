@@ -23,6 +23,14 @@ const FALLBACK_VOICES = [
   { id: "bm_george", name: "George", language: "en-gb", gender: "Male" },
 ];
 
+// Opcao "Piper TTS" exibida no seletor da pagina quando o Piper esta configurado no Models Manager.
+const PIPER_TTS_OPTION = {
+  value: "piper",
+  filename: "piper",
+  id: "piper",
+  name: "Piper TTS (external binary)",
+};
+
 function downloadUrl(url, filename) {
   const link = document.createElement("a");
   link.href = url;
@@ -49,6 +57,13 @@ export default function TextToSpeech({
   const abortRef = useRef(null);
 
   const installedModels = useMemo(() => models.filter((model) => model.installed), [models]);
+  const piperConfigured = Boolean(status.piper?.configured);
+  // Piper aparece como modelo selecionavel na pagina sempre que estiver configurado no Models Manager.
+  const selectableModels = useMemo(
+    () => (piperConfigured ? [...installedModels, PIPER_TTS_OPTION] : installedModels),
+    [installedModels, piperConfigured],
+  );
+  const isPiperSelected = selectedModel === PIPER_TTS_OPTION.value;
   const voices = status.voices?.length ? status.voices : FALLBACK_VOICES;
   const selectedVoice = ttsSettings?.voice || "af_heart";
   const speed = ttsSettings?.speed || 1;
@@ -98,6 +113,12 @@ export default function TextToSpeech({
 
   const handleLoadModel = async () => {
     if (!selectedModel) return;
+    // Piper nao precisa de "load": o binario e executado sob demanda a cada geracao.
+    if (isPiperSelected) {
+      updateTtsSetting("model", PIPER_TTS_OPTION.value);
+      await refresh();
+      return;
+    }
     setIsLoadingModel(true);
     try {
       await startTts(selectedModel, { voice: selectedVoice, speed });
@@ -125,6 +146,19 @@ export default function TextToSpeech({
     const controller = new AbortController();
     abortRef.current = controller;
     try {
+      if (isPiperSelected) {
+        // TEXT = textarea da pagina "Text to Speech"; o servidor executa:
+        // echo "${TEXT}" | piper --model "$MODEL" --output_file "${OUTPUT_FILE}"
+        const generated = await speakTts(text, {
+          engine: "piper",
+          model: PIPER_TTS_OPTION.value,
+          signal: controller.signal,
+        });
+        setOutput(generated);
+        await refresh();
+        await onOutputsChanged?.();
+        return;
+      }
       if (!status.ready || status.settings?.model !== selectedModel) {
         setIsLoadingModel(true);
         try {
@@ -159,7 +193,7 @@ export default function TextToSpeech({
     setIsGenerating(false);
   };
 
-  const isLoaded = status.ready && status.settings?.model === selectedModel;
+  const isLoaded = isPiperSelected ? piperConfigured : (status.ready && status.settings?.model === selectedModel);
 
   return (
     <div className="workspace-area speech-workspace">

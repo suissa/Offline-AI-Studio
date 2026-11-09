@@ -36,6 +36,8 @@ import {
   deleteTtsModel,
   importTtsModel,
   getTtsStatus,
+  getPiperConfig,
+  savePiperConfig,
   isLocalServerMode
 } from "../services/api";
 
@@ -308,6 +310,11 @@ function ModelManager({
   const [speechRunning, setSpeechRunning] = useState(false);
   const [activeTtsModel, setActiveTtsModel] = useState(null);
   const [ttsRunning, setTtsRunning] = useState(false);
+  // Piper TTS configuration form (Models Manager -> TTS Model Library)
+  const [piperModelPath, setPiperModelPath] = useState("");
+  const [piperBinaryPath, setPiperBinaryPath] = useState("");
+  const [piperStatus, setPiperStatus] = useState(null);
+  const [isSavingPiperConfig, setIsSavingPiperConfig] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
   const [selectedFilters, setSelectedFilters] = useState([]);
   const [huggingFaceModels, setHuggingFaceModels] = useState([]);
@@ -695,6 +702,41 @@ function ModelManager({
 
     await downloadByUrl(downloadUrl.trim(), modelName);
     setDownloadUrl("");
+  };
+
+  // ── Piper TTS: carrega a configuração salva e permite gravar MODEL_PATH / PIPER_BINARY_PATH ──
+  const refreshPiperConfig = useCallback(async () => {
+    try {
+      const data = await getPiperConfig();
+      setPiperModelPath(data.config?.modelPath || "");
+      setPiperBinaryPath(data.config?.piperBinaryPath || "");
+      setPiperStatus(data.status || null);
+    } catch (_) {}
+  }, []);
+
+  useEffect(() => {
+    if (activeModelType === "tts") {
+      refreshPiperConfig();
+    }
+  }, [activeModelType, refreshPiperConfig]);
+
+  const handleSavePiperConfig = async () => {
+    setIsSavingPiperConfig(true);
+    try {
+      const data = await savePiperConfig(piperModelPath.trim(), piperBinaryPath.trim());
+      setPiperStatus(data.status || null);
+      showAlert({
+        title: "Piper TTS Configured",
+        message: data.status?.configured
+          ? "Piper TTS is ready. Select the \"Piper TTS\" model on the Text to Speech page to generate audio."
+          : "Saved, but the paths do not exist yet. Verify MODEL_PATH and PIPER_BINARY_PATH.",
+        danger: !data.status?.configured,
+      });
+    } catch (err) {
+      showAlert({ title: "Piper Config Save Failed", message: err.message || String(err), danger: true });
+    } finally {
+      setIsSavingPiperConfig(false);
+    }
   };
 
   const handleLibraryDownload = async (model) => {
@@ -1785,6 +1827,62 @@ function ModelManager({
             {isLoadingMoreModels && <RefreshCw className="progress-spinner" size={16} />}
             <span>{isLoadingMoreModels ? "Loading more models..." : "Load More"}</span>
           </button>
+        )}
+
+        {/* ── Piper TTS configuration form (TTS Model Library) ── */}
+        {activeModelType === "tts" && (
+          <div className="m3-card" style={{ margin: 0 }}>
+            <h4 style={{ fontWeight: 700, marginBottom: "4px" }}>Piper Text-to-Speech Models</h4>
+            <p style={{ fontSize: "0.78rem", color: "var(--md-sys-color-on-surface-variant)", marginBottom: "14px" }}>
+              Use an external Piper binary with a local .onnx voice model. The server runs:
+              {" "}
+              <code style={{ fontSize: "0.72rem" }}>echo "$TEXT" | piper --model "$MODEL" --output_file "$OUTPUT_FILE"</code>
+              {" "}The WAV output is saved as YYYY-MMM-DD.wav in the same folder as MODEL_PATH.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "12px" }}>
+              <label className="speech-label" style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "0.8rem", fontWeight: 600 }}>
+                MODEL_PATH
+                <input
+                  type="text"
+                  className="m3-input"
+                  value={piperModelPath}
+                  onChange={(event) => setPiperModelPath(event.target.value)}
+                  placeholder="e.g. C:\piper\voices\en_US-lessac-medium.onnx"
+                  disabled={isSavingPiperConfig}
+                />
+              </label>
+              <label className="speech-label" style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "0.8rem", fontWeight: 600 }}>
+                PIPER_BINARY_PATH
+                <input
+                  type="text"
+                  className="m3-input"
+                  value={piperBinaryPath}
+                  onChange={(event) => setPiperBinaryPath(event.target.value)}
+                  placeholder="e.g. C:\piper\piper.exe"
+                  disabled={isSavingPiperConfig}
+                />
+              </label>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "12px", marginTop: "14px", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="m3-btn m3-btn-filled"
+                style={{ height: "36px" }}
+                onClick={handleSavePiperConfig}
+                disabled={isSavingPiperConfig || (!piperModelPath.trim() && !piperBinaryPath.trim())}
+              >
+                {isSavingPiperConfig ? <RefreshCw className="progress-spinner" size={14} /> : <HardDrive size={14} />}
+                <span>{isSavingPiperConfig ? "Saving" : "Save Piper Config"}</span>
+              </button>
+              {piperStatus && (
+                <span className={`status-chip ${piperStatus.configured ? "" : "offline"}`}>
+                  {piperStatus.configured
+                    ? "Piper ready"
+                    : `Piper ${!piperStatus.modelOk ? "MODEL_PATH missing" : ""}${!piperStatus.modelOk && !piperStatus.binaryOk ? " / " : ""}${!piperStatus.binaryOk ? "PIPER_BINARY_PATH missing" : ""}`}
+                </span>
+              )}
+            </div>
+          </div>
         )}
       </div>
 

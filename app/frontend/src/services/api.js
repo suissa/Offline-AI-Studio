@@ -777,11 +777,26 @@ export async function speakTts(text, options = {}) {
       model: options.model,
       voice: options.voice,
       speed: options.speed,
+      engine: options.engine,
     }),
     signal: options.signal,
   });
   const data = await readJsonResponse(res, "The local server returned an invalid TTS response.");
   return data.output;
+}
+
+export async function getPiperConfig() {
+  const res = await fetch("/api/tts/piper-config");
+  return await readJsonResponse(res, "The local server returned an invalid Piper TTS config response.");
+}
+
+export async function savePiperConfig(modelPath, piperBinaryPath) {
+  const res = await fetch("/api/tts/piper-config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ modelPath, piperBinaryPath }),
+  });
+  return await readJsonResponse(res, "The local server returned an invalid Piper TTS config save response.");
 }
 
 export async function downloadTtsModel(modelIdOrUrl, filename = null) {
